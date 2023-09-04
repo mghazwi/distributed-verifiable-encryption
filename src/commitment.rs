@@ -1,0 +1,192 @@
+use crate::{
+    setup::ChunkedCommitmentGens,
+    utils::{chunks_count, decompose, multiply_field_elems_with_same_group_elem},
+    serde_utils::*
+};
+use ark_ec::{AffineRepr, CurveGroup, Group, VariableBaseMSM};
+use ark_ff::{Field, One, PrimeField};
+use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
+use ark_std::{vec, vec::Vec};
+use serde::{Deserialize, Serialize};
+use serde_with::serde_as;
+
+/// Getting a commitment to the message as a single field element from commitment to its b-ary decomposition.
+///
+/// Commitment created during encryption
+/// ```text
+/// psi = m_1*Y_1 + m_2*Y_2 + ... + m_n*Y_n + r*P_2
+/// ```
+///
+/// To get a commitment to the message `m`, `m*G + r'*H` from `psi`, create a "chunked" commitment `J` as:
+///
+/// ```text
+/// J = m_1*G_1 + m_2*G_2 + ... + m_n*G_n + r'*H
+/// ```
+///
+/// where `G_i = {b^{n-i}}*G` so `G_1 = {b^{n-1}}*G`, and so on.
+///
+/// Now prove the equality of openings of the commitments `psi` and `J`. Note that `J` is same as `m*G + r'*H` because
+/// ```text
+/// m_1*G_1 + m_2*G_2 + ... + m_n*G_n + r'*H
+///   = m_1*{b^{n-1}}*G + m_2*{b^{n-2}}*G + ... + m_n*G + r'*H
+///   = ( m_1*{b^{n-1}} + m_2*{b^{n-2}} + ... + m_n ) * G + r'*H
+///   = m*G + r'*H
+/// ```
+///
+/// Since `b`, `n` and `G` are public, it can be ensured that `G_i`s are correctly created.
+///
+/// CAVEAT: Since the same blinding `r'` is used for `H` in both the chunked commitment `J` and the commitment
+/// to the full message, they can be divided to get a value that is unique to the message and thus can
+/// be used to link 2 different proofs created for the same message. One solution to this is to generate a
+/// different `G` for each proof by hashing an agreed upon string appended with a counter.
+#[serde_as]
+#[derive(
+    Clone, PartialEq, Eq, Debug, CanonicalSerialize, CanonicalDeserialize, Serialize, Deserialize,
+)]
+pub struct ChunkedCommitment<G: AffineRepr>(
+    #[serde_as(as = "ArkObjectBytes")] pub G,
+    #[serde_as(as = "Vec<ArkObjectBytes>")] pub Vec<G>,
+);
+
+impl<G: AffineRepr> ChunkedCommitment<G> {
+    /// Decompose a given field element `message` to `chunks_count` chunks each of size `chunk_bit_size` and
+    /// create a Pedersen commitment to those chunks. say `m` is decomposed as `m_1`, `m_2`, .. `m_n`.
+    /// Create commitment key as multiples of `g` as `g_n, g_{n-1}, ..., g_2, g_1` using `create_gs`. Now commit as `m_1 * g_1 + m_2 * g_2 + ... + m_n * g_n + r * h`
+    /// Return the commitment and commitment key
+    pub fn new(
+        message: &G::ScalarField,
+        blinding: &G::ScalarField,
+        chunk_bit_size: u8,
+        gens: &ChunkedCommitmentGens<G>,
+    ) -> crate::Result<Self> {
+        let decomposed = Self::get_values_to_commit(message, blinding, chunk_bit_size)?;
+        let gs = Self::commitment_key(gens, chunk_bit_size);
+        Ok(Self(
+            G::Group::msm_bigint(&gs, &decomposed).into_affine(),
+            gs,
+        ))
+    }
+
+    /// Similar to `Self::new` but expects the commitment key to be created already. Returns the commitment.
+    pub fn get_commitment_given_commitment_key(
+        message: &G::ScalarField,
+        blinding: &G::ScalarField,
+        chunk_bit_size: u8,
+        comm_key: &[G],
+    ) -> crate::Result<G> {
+        let decomposed = Self::get_values_to_commit(message, blinding, chunk_bit_size)?;
+        Ok(G::Group::msm_bigint(comm_key, &decomposed).into_affine())
+    }
+
+    /// Commitment key (vector of all `g`s and `h`) for the chunked commitment
+    /// Given a group element `g`, create `chunks_count` multiples of `g` as `g_n, g_{n-1}, ..., g_2, g_1` where each `g_i = {radix^i} * g` and `radix = 2^chunk_bit_ize`
+    pub fn commitment_key(gens: &ChunkedCommitmentGens<G>, chunk_bit_size: u8) -> Vec<G> {
+        let radix = (1 << chunk_bit_size) as u64;
+        let chunks = chunks_count::<G::ScalarField>(chunk_bit_size);
+        let gs = if radix.is_power_of_two() {
+            Self::commitment_key_for_radix_power_of_2(gens.G.into_group(), chunks, radix)
+        } else {
+            Self::commitment_key_for_radix_non_power_of_2(gens.G.into_group(), chunks, radix)
+        };
+        let mut ck = G::Group::normalize_batch(&gs);
+        ck.push(gens.H);
+        ck
+    }
+
+    fn get_values_to_commit(
+        message: &G::ScalarField,
+        blinding: &G::ScalarField,
+        chunk_bit_size: u8,
+    ) -> crate::Result<Vec<<G::ScalarField as PrimeField>::BigInt>> {
+        let mut decomposed = decompose(message, chunk_bit_size)?
+            .into_iter()
+            .map(|m| <G::ScalarField as PrimeField>::BigInt::from(m as u64))
+            .collect::<Vec<_>>();
+        decomposed.push(blinding.into_bigint());
+        Ok(decomposed)
+    }
+
+    fn commitment_key_for_radix_power_of_2(
+        g: G::Group,
+        chunks_count: u8,
+        radix: u64,
+    ) -> Vec<G::Group> {
+        let mut gs = vec![g];
+        // log2 doublings are equivalent to multiplication by radix
+        let log2 = radix.trailing_zeros();
+        for i in 1..chunks_count {
+            // Multiply the last element of `gs` by `radix` by repeated doublings
+            let mut curr = gs[i as usize - 1];
+            for _ in 0..log2 {
+                curr.double_in_place();
+            }
+            gs.push(curr);
+        }
+        gs.reverse();
+        gs
+    }
+
+    fn commitment_key_for_radix_non_power_of_2(
+        g: G::Group,
+        chunks_count: u8,
+        radix: u64,
+    ) -> Vec<G::Group> {
+        let radix = G::ScalarField::from(radix);
+        // factors = [radix^{chunks_count - 1}, radix^{chunks_count - 2}, ..., 1]
+        let mut factors = vec![];
+        for i in 1..chunks_count {
+            factors.push(radix.pow([(chunks_count - i) as u64]));
+        }
+        factors.push(G::ScalarField::one());
+        multiply_field_elems_with_same_group_elem(g, &factors)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use ark_bls12_381::{Bls12_381, G1Affine};
+    use ark_ec::pairing::Pairing;
+
+    use ark_std::{
+        collections::BTreeSet,
+        ops::Add,
+        rand::{prelude::StdRng, SeedableRng},
+        UniformRand,
+    };
+
+    use std::time::{Duration, Instant};
+
+    use crate::encryption::{tests::enc_setup, Encryption};
+
+    type Fr = <Bls12_381 as Pairing>::ScalarField;
+
+    #[test]
+    fn commitment_key_creation() {
+        fn check(chunk_bit_size: u8) {
+            let mut rng = StdRng::seed_from_u64(0u64);
+            let g = <Bls12_381 as Pairing>::G1::rand(&mut rng);
+            let chunks_count = chunks_count::<Fr>(chunk_bit_size);
+
+            let start = Instant::now();
+            let gs_1 = ChunkedCommitment::<<Bls12_381 as Pairing>::G1Affine>::commitment_key_for_radix_power_of_2(g, chunks_count, 1 << chunk_bit_size);
+            println!(
+                "commitment_key_for_radix_power_of_2 time {:?}",
+                start.elapsed()
+            );
+
+            let start = Instant::now();
+            let gs_2 = ChunkedCommitment::<<Bls12_381 as Pairing>::G1Affine>::commitment_key_for_radix_non_power_of_2(g, chunks_count, 1 << chunk_bit_size);
+            println!(
+                "commitment_key_for_radix_non_power_of_2 time {:?}",
+                start.elapsed()
+            );
+
+            assert_eq!(gs_1, gs_2);
+        }
+        check(4);
+        check(8);
+        check(16);
+    }
+}
