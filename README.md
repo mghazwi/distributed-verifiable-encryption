@@ -9,6 +9,6 @@ This is a modified version of the [`SAVER`] protocol which was implemented [`her
 See the tests.rs file
 
 [`SAVER`]: https://eprint.iacr.org/2019/1270
-[`SAVER`]: https://github.com/docknetwork/crypto
+[`here`]: https://github.com/docknetwork/crypto
 
 License: Apache-2.0
