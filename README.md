@@ -1,4 +1,5 @@
 # Dist-Saver
+WARNING: This is an academic work-in-progress proof-of-concept prototype, and in particular has not received careful code review. This implementation is NOT ready for production use.
 
 ## Verifiable encryption using DIST-SAVER
 This is a modified version of the [`SAVER`] protocol which was implemented [`here`] with the following implemented extensions:
@@ -11,4 +12,4 @@ See the tests.rs file
 [`SAVER`]: https://eprint.iacr.org/2019/1270
 [`here`]: https://github.com/docknetwork/crypto
 
-License: Apache-2.0
+This library is released under the MIT License and the Apache v2 License.
